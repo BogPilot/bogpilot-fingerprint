@@ -2,7 +2,9 @@
 
 This tool turns your own openpilot/BogPilot drive logs (`rlog` files) into a small **privacy-safe
 fingerprint file** for porting BogPilot to legacy Tesla Model S / Model X with **Autopilot 1
-(AP1, pre-AP2)**.
+(AP1, pre-AP2)**, and to **pre-AP Model S (2012–2014, no factory Autopilot hardware)**, including cars
+retrofitted with custom hardware such as a Tesla Bosch radar, a comma pedal or an iBooster
+(see [Pre-AP cars and custom hardware](#pre-ap-cars-and-custom-hardware)).
 
 * It runs **on your own computer**. It **never uploads anything**; you decide whether to share the result.
 * It keeps only what a developer needs to recognise your car: which CAN messages exist, how long they are,
@@ -77,10 +79,103 @@ You can also pass individual files: `rlog`, `rlog.zst` or `rlog.bz2`.
 | `--include-can-stats` | adds, per CAN message, *which bits ever changed* and per-byte min/max. Still no raw frames or timestamps. Helps developers a lot; see the privacy notes below. |
 | `--force` | write the file even if the privacy self-check complained. **Read the warning first.** |
 | `--no-coverage` | skip the recording-coverage report |
+| `--car-profile auto\|ap1\|ap2\|pre-ap` | which car type / checklist to use. `auto` (default): `ap1` when both factory AP1 messages 0x488 and 0x2B9 are received, `pre-ap` when a Tesla chassis bus shows no factory Autopilot messages, otherwise `unknown` (then choose one). `ap2` is manual only. See [Pre-AP cars](#pre-ap-cars-and-custom-hardware). |
+| `--preap-window SECONDS` | seconds of driving without factory Autopilot messages for a *high confidence* pre-AP result (default 60; shorter logs are judged on the whole log) |
+| `--hw radar,pedal,...` | the retrofit hardware you added, from `radar`, `pedal`, `ibooster`, `epas-firmware`, `harness`, `other`. It is written to the file and checked against the log. |
+| `--bus-map 0=chassis,1=radar,...` | which panda bus carries what, if your wiring differs from the default: BogPilot's AP1 layout (`0=chassis,1=radar,2=chassis,4=powertrain,6=powertrain`), or `0=chassis,1=radar,2=other` for a pre-AP car. Roles: `chassis`, `powertrain`, `radar`, `other`. |
 
 The tool prints a summary: car model detected, firmware, CAN message counts per bus, the coverage
 report (CORE first, then OPTIONAL, then FUTURE), blind-spot (0x399) status, and the privacy self-check result.
 **Open the JSON in a text editor and look at it before you share it.** It is plain text.
+
+### Pre-AP cars and custom hardware
+
+A 2012–2014 Model S without Autopilot hardware has no Autopilot ECU (DAS), no camera and no radar
+from the factory. The tool handles that:
+
+* **Detection (car type).** `--car-profile` always wins. With `auto` (the default):
+  * **ap1** only when **both** factory AP1 messages, 0x488 DAS_steeringControl and 0x2B9 DAS_control, are
+    *received from the car* on bus 0 or 2 (or a bus you mapped as `chassis`). A bus mapped or detected as
+    radar never counts. Other DAS messages are listed as supporting evidence only.
+  * **pre-ap** when a Tesla chassis bus is present and **no** factory Autopilot message is received. The
+    tool reports how many seconds the car was moving (from ESP_vehicleSpeed). With at least 60 s of driving
+    (`--preap-window`) the result is *high* confidence. A shorter log is judged on the whole log and marked
+    *low* confidence, unless the log also has a NotAutopilot/Tinkla pre-AP setting (see below).
+  * **unknown** in every other case (for example only 0x488, a few DAS messages, no Tesla chassis bus, or
+    GTW_carConfig saying DAS hardware is fitted while no DAS message is seen). The report gives the reason.
+    Re-run with `--car-profile ap1`, `ap2` or `pre-ap`.
+  * **ap2** is never chosen automatically. AP2 cars send 0x488/0x2B9 too, so an AP2 car shows up as `ap1`:
+    use `--car-profile ap2`. AP2 messages are not modelled yet (real AP2 logs are needed), so the DAS
+    checklist items are `n/a` for `ap2`.
+* **Frames the comma sends never count.** NotAutopilot and Tinkla send 0x488, 0x2B9 and 0x214 from the comma
+  on a pre-AP car. Those frames are in `sendcan` and in the panda's transmit echoes, which the tool ignores for
+  detection, so they cannot make a pre-AP car look like AP1.
+* **Fork settings are hints only.** The report lists these when it finds them, and they raise the confidence
+  of a pre-AP result, but they never change the car type on their own:
+  NotAutopilot safety model `teslaPreap` (37), `carFingerprint` `TESLA_MODEL_S_PREAP`, params
+  `NAPForcePreAP=1` (on by default in NotAutopilot) and `NAPCarType=1`; Tinkla `carFingerprint`
+  `TESLA PREAP MODEL S` and param `TinklaAPForceFingerprint`. (Tinkla uses its own panda firmware with the
+  upstream `tesla` safety model, so its safety model is not a hint.) Factory fingerprint lengths are shown as
+  hints too: 0x505 (8 bytes) and 0x227 with 4 bytes point to pre-AP, 0x227 with 5 bytes to AP1.
+* **Bus map.** For a pre-AP car, without `--bus-map`, the tool uses `0=chassis,1=radar,2=other`: chassis on
+  CAN0, Bosch radar on CAN1 and the pedal on CAN2, as Tinkla and NotAutopilot wire it (the pedal can also be
+  on CAN0). AP1 keeps `0=chassis,1=radar,2=chassis,4=powertrain,6=powertrain`.
+* **Checklist.** Items that only the factory Autopilot ECU sends (stock DAS control, blind spot 0x399,
+  stock cluster messages, DAS_steeringControl 0x488, stock AP wiper/high-beam requests) are shown as
+  `n/a` with the reason, and do not count against the VERDICT. EPB_epasControl (0x214) is also `n/a`: a
+  pre-AP car does not send it (Tinkla/NotAutopilot send it from the comma). All other CORE items are still
+  required.
+* **Not recognised by openpilot yet?** If openpilot did not identify the car (`carName` is `mock`) but
+  the log has a Tesla chassis bus, the coverage report is still made, with a note.
+* **Retrofit hardware** is reported separately and never decides the car type (address and length only):
+  * Tesla Bosch radar: 0x301, 0x302, 0x501 plus radar track messages, on any bus. The radar CORE check uses
+    whichever bus it is on. On the radar bus, 0x300 means the radar is active and 0x631 means it is
+    initialising. 0x631 without 0x300 gives the hint "radar not syncing (check VIN learn / GTW emulation)".
+    A Bosch radar in a pre-AP car only works after it has learned the car's VIN and while the panda
+    emulates the gateway messages it expects (both Tinkla and NotAutopilot do this).
+  * comma pedal: 0x552 from the pedal, 0x551 sent by the comma. 0x200/0x201 with 6 bytes on a non-chassis
+    bus means a pedal with the **stock comma firmware IDs**, which clash with SDM1 (0x201, seat belt);
+    flash the Tinkla/NotAutopilot pedal firmware (0x551/0x552).
+  * iBooster: the retrofit iBooster ECU (0x554, 0x556; 0x553 and 0x555 sent by the comma). The IBST_*
+    messages (0x39D, 0x32D, 0x35D) are **factory on AP1 cars**, so they count as a retrofit only on a pre-AP
+    car; on AP1 they are listed under `retrofit_hardware.factory_hardware`.
+  * EPAS firmware cannot be read from the log, and a patched pre-AP EPAS often runs AP1 firmware anyway, so
+    the EPAS firmware never helps tell pre-AP from AP1. `--hw epas-firmware` is recorded as you declare it.
+
+  Declare what you installed with `--hw`; anything you declared but the log does not show is flagged.
+* **Unknown messages.** Extra messages from aftermarket hardware never break the tool. They are kept in
+  the CAN fingerprint, and addresses that the bundled Tesla DBCs do not describe are listed per bus under
+  `retrofit_hardware.unrecognized_addresses`.
+* **Wiring.** If your harness puts the chassis, powertrain or radar on different panda buses, the summary
+  shows the layout the log suggests. Re-run with `--bus-map` to match it.
+
+Example for a pre-AP car with a Bosch radar and a pedal:
+
+```bash
+python3 bogpilot_fingerprint.py my_drive/ -o my_car_fingerprint.json --car-profile pre-ap --hw radar,pedal
+```
+
+This tool only records and checks your logs. It does not make BogPilot drive a pre-AP car. That still
+needs a pre-AP car port in BogPilot (and, for steering, an EPAS that accepts steering commands).
+
+### Coming from NotAutopilot
+
+If your pre-AP car already runs NotAutopilot (or Tinkla), record your drive with it as usual and then:
+
+1. **Choose the profile yourself:** `--car-profile pre-ap`. Auto-detection usually gets there too (and the
+   report lists the NotAutopilot settings it found), but naming the profile removes any doubt.
+2. **Bus map:** the pre-AP default `0=chassis,1=radar,2=other` matches NotAutopilot's wiring (pedal on CAN2).
+   If you moved the pedal to CAN0 or wired anything else differently, pass `--bus-map`.
+3. **EPAS:** if you already flashed the patched EPAS firmware with NotAutopilot or Tinkla, there is nothing
+   to redo for this tool. Add `--hw epas-firmware` so the report says so; the log cannot show it.
+4. **Radar:** if you use a Bosch radar, it must have learned your VIN and the panda must emulate the gateway
+   (NotAutopilot does both when the radar is enabled). If the report says "radar not syncing", fix that in
+   NotAutopilot first, then record again.
+5. **NotAutopilot logs:** older versions of this tool stopped on NotAutopilot logs (safety model
+   `teslaPreap`, 37, is newer than the bundled log schema). This version reads them.
+
+A matching BogPilot setting (to pick the pre-AP car type on the device, like `NAPCarType`) is **planned,
+not shipped**. Until it exists, `--car-profile` here is only for this report.
 
 ---
 
@@ -192,12 +287,14 @@ right warning was ever active.
 
 * GPS and location: `gpsLocation*`, `ubloxGnss`, `qcomGnss`, `liveLocation*`, navigation, mapd, and the
   car's own GPS CAN messages (see the table below)
-* the **VIN** everywhere: `carParams.carVin`, firmware strings, and the VIN that the car itself sends on CAN.
+* the **VIN** everywhere: `carParams.carVin`, firmware strings, and the VIN that the car itself sends on CAN
+  (0x508, 0x405, and the copy sent to the radar on 0x2B9).
   The tool rebuilds that VIN internally only to make sure it is not in the output.
 * camera, driver monitoring, microphone, video files
 * all timestamps (`logMonoTime`, wall clock, route/segment names, the car's clock on CAN)
 * device and user IDs: dongle ID, device serial, boot log ID, IMEI/ICCID, Wi-Fi/network info, IP addresses
-* `params`, log/error messages, process lists, device state
+* `params` (only three fork settings, `NAPForcePreAP`, `NAPCarType` and `TinklaAPForceFingerprint`, are compared
+  with fixed values to spot a pre-AP setup; no param value is written), log/error messages, process lists, device state
 * raw CAN frames (payloads are never exported)
 
 **Messages never included in `--include-can-stats`** (even their changing bits):
@@ -206,8 +303,11 @@ right warning was ever active.
 |---|---|
 | 0x508 | VIN (3 pages of ASCII) |
 | 0x2B9 | VIN sent to the radar (same address is DAS_control on the AP bus; it is hidden on all buses to be safe) |
+| 0x405 | VIN (pre-AP cars send it on the chassis bus instead of 0x508) |
+| 0x2A9 | car configuration / country code sent to the radar |
 | 0x5D8, 0x562, 0x209 | odometer values |
 | 0x3D2 | lifetime energy counters |
+| 0x32D | iBooster part/CRC identifiers |
 | 0x3D8, 0x068, 0x2F8 | GPS position / elevation / heading |
 | 0x246 | sun position (reveals time and place) |
 | 0x3C8, 0x398 | map data / country code |
@@ -228,7 +328,8 @@ are sure it is harmless (for example, a part number that only looks like a seria
 ## 7. Sharing it
 
 The tool does not upload. To help the BogPilot port, open an issue on the BogPilot GitHub repository
-(e.g. "AP1 fingerprint: Model S 2015 P85D"), mention the model/year (no VIN), and **attach**
+(e.g. "AP1 fingerprint: Model S 2015 P85D" or "Pre-AP fingerprint: Model S 2013 P85 + Bosch radar"),
+mention the model/year and any retrofit hardware (no VIN), and **attach**
 `my_car_fingerprint.json` (or the `.zip`). Attach the file rather than pasting it, and look through it first.
 
 ## 8. Troubleshooting
